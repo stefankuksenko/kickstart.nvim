@@ -91,7 +91,32 @@ vim.g.mapleader = ' '
 vim.g.maplocalleader = ' '
 
 -- Set to true if you have a Nerd Font installed and selected in the terminal
-vim.g.have_nerd_font = false
+vim.g.have_nerd_font = true
+
+-- Detect Helm templates as 'helm' filetype (so helm_ls attaches instead of yamlls)
+vim.filetype.add {
+  pattern = {
+    ['.*/templates/.*%.yaml'] = 'helm',
+    ['.*/templates/.*%.tpl'] = 'helm',
+    ['helmfile.*%.yaml'] = 'helm',
+  },
+}
+
+-- Show tab names as the working directory name
+vim.o.tabline = '%!v:lua.custom_tabline()'
+function _G.custom_tabline()
+  local s = ''
+  for i = 1, vim.fn.tabpagenr '$' do
+    local cwd = vim.fn.getcwd(-1, i)
+    local name = vim.fn.fnamemodify(cwd, ':t')
+    if i == vim.fn.tabpagenr() then
+      s = s .. '%#TabLineSel# ' .. name .. ' '
+    else
+      s = s .. '%#TabLine# ' .. name .. ' '
+    end
+  end
+  return s .. '%#TabLineFill#'
+end
 
 -- [[ Setting options ]]
 -- See `:help vim.o`
@@ -102,7 +127,7 @@ vim.g.have_nerd_font = false
 vim.o.number = true
 -- You can also add relative line numbers, to help with jumping.
 --  Experiment for yourself to see if you like it!
--- vim.o.relativenumber = true
+vim.o.relativenumber = true
 
 -- Enable mouse mode, can be useful for resizing splits for example!
 vim.o.mouse = 'a'
@@ -166,12 +191,165 @@ vim.o.scrolloff = 10
 -- See `:help 'confirm'`
 vim.o.confirm = true
 
+-- Auto-reload files changed outside nvim (with change notification)
+vim.o.autoread = true
+local last_known_mtime = {} -- buf -> mtime
+
+-- Auto-reload: update stored mtime after user saves (so saves don't false-trigger)
+vim.api.nvim_create_autocmd('BufWritePost', {
+  pattern = '*',
+  callback = function(args)
+    if vim.bo[args.buf].buftype ~= '' then
+      return
+    end
+    local filepath = vim.api.nvim_buf_get_name(args.buf)
+    if filepath ~= '' then
+      last_known_mtime[args.buf] = vim.fn.getftime(filepath)
+    end
+  end,
+})
+
+-- Auto-reload: check for external changes via file mtime and notify
+vim.api.nvim_create_autocmd({ 'FocusGained', 'BufEnter', 'CursorHold', 'CursorHoldI' }, {
+  pattern = '*',
+  callback = function()
+    if vim.fn.mode() == 'c' then
+      return
+    end
+    local buf = vim.api.nvim_get_current_buf()
+    if not vim.api.nvim_buf_is_loaded(buf) or vim.bo[buf].modified or vim.bo[buf].buftype ~= '' then
+      return
+    end
+
+    local filepath = vim.api.nvim_buf_get_name(buf)
+    if filepath == '' then
+      return
+    end
+
+    local mtime = vim.fn.getftime(filepath)
+    local prev = last_known_mtime[buf]
+    last_known_mtime[buf] = mtime
+
+    if not prev or mtime == prev then
+      return
+    end
+
+    vim.cmd 'checktime'
+    vim.notify('File reloaded from disk', vim.log.levels.INFO)
+  end,
+})
+
+-- :DiffOrig — diff your unsaved buffer vs what's on disk
+vim.api.nvim_create_user_command('DiffOrig', function()
+  if vim.fn.expand '%' == '' then
+    vim.notify('DiffOrig: buffer has no file', vim.log.levels.WARN)
+    return
+  end
+  if vim.wo.diff then
+    vim.notify('Already in diff mode. Use :diffoff! and :q to exit first.', vim.log.levels.WARN)
+    return
+  end
+  local filename = vim.fn.expand '%:t'
+  vim.cmd 'vert new | set buftype=nofile | read ++edit # | 0d_ | diffthis'
+  vim.api.nvim_buf_set_name(0, '[Disk] ' .. filename)
+  vim.cmd 'wincmd p | diffthis'
+end, {})
+
 -- [[ Basic Keymaps ]]
 --  See `:help vim.keymap.set()`
 
 -- Clear highlights on search when pressing <Esc> in normal mode
 --  See `:help hlsearch`
 vim.keymap.set('n', '<Esc>', '<cmd>nohlsearch<CR>')
+
+-- Copy full file path to clipboard
+vim.keymap.set('n', '<leader>cp', function()
+  local path = vim.fn.expand '%:p'
+  vim.fn.setreg('+', path)
+  vim.notify(path, vim.log.levels.INFO)
+end, { desc = '[C]opy file [P]ath' })
+
+-- Copy directory path to clipboard
+vim.keymap.set('n', '<leader>cd', function()
+  local dir = vim.fn.expand '%:p:h'
+  vim.fn.setreg('+', dir)
+  vim.notify(dir, vim.log.levels.INFO)
+end, { desc = '[C]opy [D]irectory path' })
+
+-- Open a directory in a new tab (like adding a workspace folder)
+vim.keymap.set('n', '<leader>tp', function()
+  vim.ui.input({ prompt = 'Open project: ', default = '~/github/', completion = 'dir' }, function(dir)
+    if dir and dir ~= '' then
+      dir = vim.fn.expand(dir)
+      vim.cmd 'tabnew'
+      vim.cmd('tcd ' .. vim.fn.fnameescape(dir))
+      vim.cmd 'Neotree reveal'
+    end
+  end)
+end, { desc = '[T]ab open [P]roject' })
+
+-- Open Ghostty split in the current file's directory (or neo-tree selected directory)
+local function get_current_dir()
+  if vim.bo.filetype == 'neo-tree' then
+    local state = require('neo-tree.sources.manager').get_state 'filesystem'
+    local node = state.tree:get_node()
+    local path = node:get_id()
+    if node.type ~= 'directory' then
+      path = vim.fn.fnamemodify(path, ':h')
+    end
+    return path
+  end
+  local bufname = vim.fn.expand '%:p:h'
+  if bufname ~= '' then return bufname end
+  return vim.fn.getcwd()
+end
+
+local function ghostty_split(direction)
+  if vim.env.TERM_PROGRAM ~= 'ghostty' then
+    vim.notify('Not running inside Ghostty', vim.log.levels.WARN)
+    return
+  end
+  local dir = get_current_dir()
+  local hostname = vim.fn.hostname()
+  -- Emit OSC 7 to set Ghostty's CWD before split
+  local osc7 = string.format('\027]7;file://%s%s\007', hostname, dir)
+  io.write(osc7)
+  -- Send Cmd+D or Cmd+Shift+D via osascript
+  local keystroke
+  if direction == 'down' then
+    keystroke = 'keystroke "d" using {command down, shift down}'
+  else
+    keystroke = 'keystroke "d" using command down'
+  end
+  vim.fn.jobstart({
+    'osascript',
+    '-e', 'tell application "System Events" to ' .. keystroke,
+  }, { detach = true })
+  vim.notify('Terminal: ' .. dir, vim.log.levels.INFO)
+end
+
+vim.keymap.set('n', '<leader>ts', function() ghostty_split 'right' end, { desc = '[T]erminal [S]plit right' })
+vim.keymap.set('n', '<leader>tS', function() ghostty_split 'down' end, { desc = '[T]erminal [S]plit down' })
+
+-- List git-changed directories in a scratch buffer (full paths, one per line)
+vim.keymap.set('n', '<leader>gd', function()
+  vim.cmd 'new'
+  vim.bo.buftype = 'nofile'
+  vim.bo.bufhidden = 'wipe'
+  vim.api.nvim_buf_set_name(0, '[Git Changed Dirs]')
+  vim.cmd 'r !git diff --name-only | xargs -I{} dirname {} | sort -u | xargs -I{} realpath {}'
+  vim.cmd '0d_'
+end, { desc = '[G]it changed [D]irectories' })
+
+-- Side-by-side diff with another file (word-wrapped for long lines)
+vim.keymap.set('n', '<leader>df', function()
+  vim.ui.input({ prompt = 'Diff with: ', completion = 'file' }, function(file)
+    if not file or file == '' then return end
+    file = vim.fn.expand(file)
+    vim.cmd('vert diffsplit ' .. vim.fn.fnameescape(file))
+    vim.cmd 'windo setlocal wrap'
+  end)
+end, { desc = '[D]iff [F]ile side-by-side' })
 
 -- Diagnostic keymaps
 vim.keymap.set('n', '<leader>q', vim.diagnostic.setloclist, { desc = 'Open diagnostic [Q]uickfix list' })
@@ -185,10 +363,10 @@ vim.keymap.set('n', '<leader>q', vim.diagnostic.setloclist, { desc = 'Open diagn
 vim.keymap.set('t', '<Esc><Esc>', '<C-\\><C-n>', { desc = 'Exit terminal mode' })
 
 -- TIP: Disable arrow keys in normal mode
--- vim.keymap.set('n', '<left>', '<cmd>echo "Use h to move!!"<CR>')
--- vim.keymap.set('n', '<right>', '<cmd>echo "Use l to move!!"<CR>')
--- vim.keymap.set('n', '<up>', '<cmd>echo "Use k to move!!"<CR>')
--- vim.keymap.set('n', '<down>', '<cmd>echo "Use j to move!!"<CR>')
+vim.keymap.set('n', '<left>', '<cmd>echo "Use h to move!!"<CR>')
+vim.keymap.set('n', '<right>', '<cmd>echo "Use l to move!!"<CR>')
+vim.keymap.set('n', '<up>', '<cmd>echo "Use k to move!!"<CR>')
+vim.keymap.set('n', '<down>', '<cmd>echo "Use j to move!!"<CR>')
 
 -- Keybinds to make split navigation easier.
 --  Use CTRL+<hjkl> to switch between windows
@@ -283,6 +461,8 @@ require('lazy').setup({
       },
     },
   },
+  { 'lewis6991/satellite.nvim', opts = {} },
+  { 'b0o/schemastore.nvim' }, -- JSON/YAML schema catalog for yamlls
 
   -- NOTE: Plugins can also be configured to run Lua code when they are loaded.
   --
@@ -407,12 +587,26 @@ require('lazy').setup({
         -- You can put your default mappings / updates / etc. in here
         --  All the info you're looking for is in `:help telescope.setup()`
         --
-        -- defaults = {
-        --   mappings = {
-        --     i = { ['<c-enter>'] = 'to_fuzzy_refine' },
-        --   },
-        -- },
-        -- pickers = {}
+        defaults = {
+          vimgrep_arguments = {
+            'rg',
+            '--color=never',
+            '--no-heading',
+            '--with-filename',
+            '--line-number',
+            '--column',
+            '--smart-case',
+            '--hidden',
+            '--glob',
+            '!.git/',
+          },
+        },
+        pickers = {
+          find_files = {
+            hidden = true,
+            find_command = { 'rg', '--files', '--hidden', '--glob', '!.git/' },
+          },
+        },
         extensions = {
           ['ui-select'] = {
             require('telescope.themes').get_dropdown(),
@@ -436,6 +630,7 @@ require('lazy').setup({
       vim.keymap.set('n', '<leader>sr', builtin.resume, { desc = '[S]earch [R]esume' })
       vim.keymap.set('n', '<leader>s.', builtin.oldfiles, { desc = '[S]earch Recent Files ("." for repeat)' })
       vim.keymap.set('n', '<leader><leader>', builtin.buffers, { desc = '[ ] Find existing buffers' })
+      vim.keymap.set('n', '<leader>gs', builtin.git_status, { desc = '[G]it [S]tatus' })
 
       -- Slightly advanced example of overriding default behavior and theme
       vim.keymap.set('n', '<leader>/', function()
@@ -459,6 +654,10 @@ require('lazy').setup({
       vim.keymap.set('n', '<leader>sn', function()
         builtin.find_files { cwd = vim.fn.stdpath 'config' }
       end, { desc = '[S]earch [N]eovim files' })
+
+      vim.keymap.set('n', '<leader>sc', function()
+        builtin.find_files { cwd = '~/.config', hidden = true }
+      end, { desc = '[S]earch [C]onfig files (~/.config)' })
     end,
   },
 
@@ -684,6 +883,41 @@ require('lazy').setup({
         -- ts_ls = {},
         --
 
+        yamlls = {
+          filetypes = { 'yaml', 'yaml.docker-compose', 'yaml.gitlab' },
+          settings = {
+            yaml = {
+              schemaStore = { enable = false, url = '' },
+              schemas = require('schemastore').yaml.schemas(),
+              validate = true,
+              format = { enable = true },
+              keyOrdering = false,
+              kubernetesCRDStore = { enable = true },
+            },
+            redhat = { telemetry = { enabled = false } },
+          },
+        },
+
+        helm_ls = {
+          settings = {
+            ['helm-ls'] = {
+              yamlls = {
+                path = 'yaml-language-server',
+                config = {
+                  schemas = {
+                    kubernetes = 'templates/**',
+                  },
+                  kubernetesCRDStore = { enable = true },
+                },
+              },
+            },
+          },
+        },
+
+        terraformls = {
+          filetypes = { 'terraform', 'terraform-vars' },
+        },
+
         lua_ls = {
           -- cmd = { ... },
           -- filetypes = { ... },
@@ -768,6 +1002,8 @@ require('lazy').setup({
       end,
       formatters_by_ft = {
         lua = { 'stylua' },
+        terraform = { 'terraform_fmt' },
+        ['terraform-vars'] = { 'terraform_fmt' },
         -- Conform can also run multiple formatters sequentially
         -- python = { "isort", "black" },
         --
@@ -944,7 +1180,30 @@ require('lazy').setup({
     main = 'nvim-treesitter.configs', -- Sets main module to use for opts
     -- [[ Configure Treesitter ]] See `:help nvim-treesitter`
     opts = {
-      ensure_installed = { 'bash', 'c', 'diff', 'html', 'lua', 'luadoc', 'markdown', 'markdown_inline', 'query', 'vim', 'vimdoc' },
+      ensure_installed = {
+        'bash',
+        'c',
+        'diff',
+        'go',
+        'gotmpl',
+        'hcl',
+        'helm',
+        'html',
+        'java',
+        'json',
+        'lua',
+        'luadoc',
+        'markdown',
+        'markdown_inline',
+        'python',
+        'query',
+        'terraform',
+        'typescript',
+        'tsx',
+        'vim',
+        'vimdoc',
+        'yaml',
+      },
       -- Autoinstall languages that are not installed
       auto_install = true,
       highlight = {
@@ -964,6 +1223,13 @@ require('lazy').setup({
     --    - Treesitter + textobjects: https://github.com/nvim-treesitter/nvim-treesitter-textobjects
   },
 
+  { -- Sticky scroll — shows parent context (YAML keys, function names, etc.) pinned at the top
+    'nvim-treesitter/nvim-treesitter-context',
+    opts = {
+      max_lines = 5, -- max number of context lines pinned at top
+    },
+  },
+
   -- The following comments only work if you have downloaded the kickstart repo, not just copy pasted the
   -- init.lua. If you want these files, they are in the repository, so you can just download them and
   -- place them in the correct locations.
@@ -974,11 +1240,40 @@ require('lazy').setup({
   --  Uncomment any of the lines below to enable them (you will need to restart nvim).
   --
   -- require 'kickstart.plugins.debug',
-  -- require 'kickstart.plugins.indent_line',
+  require 'kickstart.plugins.indent_line',
   -- require 'kickstart.plugins.lint',
-  -- require 'kickstart.plugins.autopairs',
-  -- require 'kickstart.plugins.neo-tree',
-  -- require 'kickstart.plugins.gitsigns', -- adds gitsigns recommend keymaps
+  require 'kickstart.plugins.autopairs',
+  require 'kickstart.plugins.neo-tree',
+  require 'kickstart.plugins.gitsigns', -- adds gitsigns recommend keymaps
+
+  { -- Open current file/line on GitHub (copy or browse)
+    'linrongbin16/gitlinker.nvim',
+    cmd = 'GitLink',
+    opts = {},
+    keys = {
+      { '<leader>gy', '<cmd>GitLink<cr>', mode = { 'n', 'v' }, desc = '[G]it [Y]ank link' },
+      { '<leader>gY', '<cmd>GitLink!<cr>', mode = { 'n', 'v' }, desc = '[G]it open link in browser' },
+    },
+  },
+
+  { -- Open the PR/commit that last changed the current line
+    'h3pei/trace-pr.nvim',
+    cmd = 'TracePR',
+    opts = {},
+    keys = {
+      { '<leader>gp', '<cmd>TracePR<cr>', desc = '[G]it trace [P]R for current line' },
+    },
+  },
+
+  { -- Render markdown inline (headings, lists, code blocks, tables)
+    'MeanderingProgrammer/render-markdown.nvim',
+    ft = { 'markdown' },
+    dependencies = {
+      'nvim-treesitter/nvim-treesitter',
+      'nvim-tree/nvim-web-devicons',
+    },
+    opts = {},
+  },
 
   -- NOTE: The import below can automatically add your own plugins, configuration, etc from `lua/custom/plugins/*.lua`
   --    This is the easiest way to modularize your config.
